@@ -1,0 +1,70 @@
+# {{ podcast_name }} - {{ episode_title }}
+
+> **日期**: {{ date }}
+> **播客**: {{ podcast_name }}
+> **剧集**: {{ episode_title }}
+> **时长**: {{ duration }}
+{% if audio_url %}
+> **音频链接**: [收听原始音频]({{ audio_url }})
+{% endif %}
+
+---
+
+## 📝 内容总结
+
+{{ summary }}
+
+---
+
+## 🎯 核心要点
+
+{% for point in key_points %}
+{{ loop.index }}. {{ point }}
+{% endfor %}
+
+---
+
+## 💡 主要观点
+
+{% for opinion in main_opinions %}
+### {{ loop.index }}. {{ opinion.title }}
+
+**摘要**: {{ opinion.summary }}
+
+<details>
+<summary>点击展开详细内容</summary>
+
+{{ opinion.details }}
+
+{% if opinion.supporting_quotes %}
+**相关引用:**
+
+{% for quote in opinion.supporting_quotes %}
+> {{ quote }}
+
+{% endfor %}
+{% endif %}
+
+</details>
+
+{% endfor %}
+
+---
+
+## 📚 知识点分析学习
+
+{% for category, points in knowledge_by_category.items() %}
+### {{ category }}
+
+{% for kp in points %}
+#### {{ kp.concept }}
+
+{{ kp.explanation }}
+
+{% endfor %}
+{% endfor %}
+
+---
+
+*本文档由播客自动化处理系统自动生成*
+*生成时间: {{ generated_at }}*

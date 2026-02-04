@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  podcast-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: podcast-automation
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./summaries:/app/summaries
+      - ./config:/app/config:ro
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/podcast.db
+      - SUMMARIES_DIR=./summaries
+      - LOG_DIR=./logs
+      - AUDIO_TEMP_DIR=./temp/audio
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+  # Optional: PostgreSQL database (uncomment to use instead of SQLite)
+  # postgres:
+  #   image: postgres:16-alpine
+  #   container_name: podcast-db
+  #   restart: unless-stopped
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   environment:
+  #     POSTGRES_DB: podcast_automation
+  #     POSTGRES_USER: podcast
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+  #   ports:
+  #     - "5432:5432"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U podcast"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+# volumes:
+#   postgres_data:

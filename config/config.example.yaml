@@ -1,0 +1,90 @@
+# ============================================
+# 播客自动化系统配置文件
+# Podcast Automation System Configuration
+# ============================================
+# 将此文件复制为 config.yaml 并修改相应配置
+# Copy this file to config.yaml and modify accordingly
+
+# --- 播客 RSS 源列表 ---
+podcasts:
+  - name: "示例播客1"
+    rss_url: "https://example.com/podcast1/feed.xml"
+    enabled: true
+    language: "zh-CN"
+  - name: "示例播客2"
+    rss_url: "https://example.com/podcast2/rss"
+    enabled: true
+    language: "zh-CN"
+
+# --- API 配置 ---
+api:
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    api_base: "https://api.openai.com/v1"
+    model: "gpt-4"
+    whisper_model: "whisper-1"
+    max_tokens: 4096
+    temperature: 0.3
+  itunes:
+    enabled: true
+    search_limit: 10
+  spotify:
+    enabled: false
+    client_id: "${SPOTIFY_CLIENT_ID}"
+    client_secret: "${SPOTIFY_CLIENT_SECRET}"
+
+# --- 调度配置 ---
+scheduler:
+  enabled: true
+  cron:
+    hour: 23
+    minute: 0
+  timezone: "Asia/Shanghai"
+  max_retry: 3
+  retry_backoff_base: 2
+
+# --- 处理配置 ---
+processing:
+  max_concurrent_feeds: 5
+  incremental_update_hours: 24
+  audio:
+    supported_formats:
+      - "mp3"
+      - "m4a"
+      - "wav"
+      - "ogg"
+    max_duration_hours: 4
+    temp_dir: "./temp/audio"
+  analysis:
+    summary_min_length: 1000
+    summary_max_length: 2000
+    key_points_count: 8
+    language: "zh-CN"
+
+# --- 存储配置 ---
+storage:
+  database_url: "sqlite+aiosqlite:///./data/podcast.db"
+  summaries_dir: "./summaries"
+  log_dir: "./logs"
+
+# --- 文档生成配置 ---
+document:
+  template: "templates/podcast_summary.md.j2"
+  naming_format: "{date}-podcast-summary.md"
+  export_formats:
+    - "markdown"
+    - "pdf"
+
+# --- 日志配置 ---
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/podcast-automation.log"
+  max_size_mb: 50
+  backup_count: 5
+
+# --- 内存监控 ---
+memory:
+  limit_mb: 1024
+  check_interval_seconds: 60
+  alert_threshold_percent: 80

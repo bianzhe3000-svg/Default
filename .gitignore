@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Config (keep examples)
+config/config.yaml
+
+# Database
+data/
+*.db
+*.sqlite3
+
+# Temporary files
+temp/
+tmp/
+
+# Logs
+logs/
+*.log
+
+# Generated summaries (keep directory)
+summaries/*
+!summaries/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test and coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Distribution
+*.tar.gz
+*.whl
