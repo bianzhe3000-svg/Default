@@ -47,7 +47,7 @@ from src.utils.logger import setup_logging
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="PDF → 飞书云文档：解析 PDF → LLM 总结 → 生成 Markdown → 导入飞书",
+        description="PDF → 飞书云文档：解析 PDF → LLM 总结 → Block 转换 → 追加式写入",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("pdf", help="PDF 文件路径")
@@ -115,6 +115,8 @@ async def main() -> None:
         openai_model=args.model,
         pages_per_chunk=args.pages_per_chunk,
         max_chars_per_section=args.max_chars,
+        block_batch_size=50,
+        block_batch_delay=0.5,
     )
 
     url = await pdf_to_feishu(
