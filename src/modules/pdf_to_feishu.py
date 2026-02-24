@@ -1,24 +1,24 @@
 """
-PDF → 飞书云文档 完整方案（v3：追加式同步 Block 插入，修复乱序 bug）
+PDF → 飞书云文档 完整方案（v4：版本号链式逐条插入，彻底解决长文档乱序）
 
-v2 的致命 bug（导致完全乱序）：
-  inserted = len(data.get("data", {}).get("children", []))
-  current_index += inserted
-  ↑ 飞书 API 响应里 children 字段可能为空列表或缺失，导致 inserted=0，
-    每一批都插入到 index=0，结果是完全倒序（最后批在最顶，第一批在最底）。
+历代 bug 回顾：
+  v2: index 计数错误 → 完全倒序
+  v3: 批量追加 + rev=-1 → 短文档OK，长文档密集请求版本号冲突 → 乱序
+      超时重试可能导致重复插入 → 乱序
 
-v3 修复原理：
-  彻底去掉 index 参数。飞书 API 文档说明：
-    「不填或超出实际 children 数量时，默认从最后插入」
-  只要每批之间 await 等待完成，服务端就按串行顺序追加，
-  顺序完全由 Python 的串行 for 循环保证，不依赖任何计数。
+v4 修复原理：
+  ★ 每次只插入 1 个 block（不再批量）
+  ★ 传入上一次返回的 revision_id（不再用 -1）
+  ★ 形成 rev1 → rev2 → rev3 → ... 的严格链式写入
+  ★ 超时时查询当前版本号判断是否已插入，杜绝重复
+  ★ 自适应延迟 + 限流退避 + Token 自动续期
 
 流程：
   1. 解析 PDF（PyMuPDF 或 MinerU content_list.json）
   2. 按章节顺序逐节 LLM 总结（order 字段锁定，禁止并发）
   3. SectionSummary → 飞书 Block JSON（纯内存转换）
   4. 创建空白云文档
-  5. 分批追加 blocks（无 index，自动 append，严格串行 await）
+  5. 版本号链式逐条插入 blocks
 
 依赖安装：
   pip install PyMuPDF httpx openai
@@ -410,17 +410,14 @@ class FeishuBlockConverter:
 
 class FeishuDocWriter:
     """
-    创建飞书云文档并追加式写入所有 Block。
+    创建飞书云文档并版本号链式逐条写入所有 Block。
 
-    v3 核心修复：
-      去掉 insert 请求中的 index 参数。
-      飞书 API：「index 不填时默认从最后插入」。
-      每批之间有 await，Python 保证串行，服务端按到达顺序追加，不可能乱序。
-
-    对比 v2 的 bug（index 计数错误）：
-      v2 用 len(data["data"]["children"]) 计算 inserted，
-      该字段可能为空列表 → inserted=0 → 所有批次都插入 index=0
-      → 最后一批在最顶，完全倒序。
+    v4 核心修复（彻底解决长文档乱序）：
+      ★ 每次只插入 1 个 block（不再批量）
+      ★ 传入上一次返回的 revision_id（不再用 -1）
+      ★ 形成 rev1 → rev2 → rev3 → ... 的严格链式写入
+      ★ 超时时查询当前版本号判断是否已插入，杜绝重复
+      ★ 自适应延迟 + 限流退避 + Token 自动续期
 
     飞书 API 权限要求：
       - docx:document（创建/编辑云文档）
@@ -434,10 +431,10 @@ class FeishuDocWriter:
         self._token: str | None = None
         self._token_expire: float = 0.0
 
-    # ── 鉴权（App Token）────────────────────────────────────────────────────
+    # ── 鉴权（App Token，自动续期）──────────────────────────────────────────
 
     async def _get_token(self, client: httpx.AsyncClient) -> str:
-        if self._token and time.time() < self._token_expire - 60:
+        if self._token and time.time() < self._token_expire - 120:
             return self._token
 
         resp = await client.post(
@@ -461,8 +458,10 @@ class FeishuDocWriter:
     # ── 创建空白文档 ─────────────────────────────────────────────────────────
 
     @async_retry(max_attempts=3, retryable_exceptions=(httpx.HTTPError, RuntimeError))
-    async def _create_doc(self, client: httpx.AsyncClient, token: str, title: str) -> str:
-        """创建空白文档，返回 document_id（同时也是根 block 的 block_id）。"""
+    async def _create_doc(
+        self, client: httpx.AsyncClient, token: str, title: str
+    ) -> tuple[str, int]:
+        """创建空白文档，返回 (document_id, revision_id)。"""
         resp = await client.post(
             f"{self._BASE}/docx/v1/documents",
             headers=self._hdr(token),
@@ -473,95 +472,172 @@ class FeishuDocWriter:
         data = resp.json()
         if data.get("code") != 0:
             raise RuntimeError(f"创建文档失败: code={data['code']}, msg={data.get('msg')}")
-        doc_id = data["data"]["document"]["document_id"]
-        logger.info("空白文档已创建: document_id=%s", doc_id)
-        return doc_id
+        doc = data["data"]["document"]
+        doc_id = doc["document_id"]
+        rev_id = doc.get("revision_id", 1)
+        logger.info("空白文档已创建: document_id=%s, revision=%d", doc_id, rev_id)
+        return doc_id, rev_id
 
-    # ── 追加一批 Block（v3 关键：无 index 参数）──────────────────────────────
+    # ── 查询当前版本号（用于超时后验证）──────────────────────────────────────
 
-    @async_retry(max_attempts=3, retryable_exceptions=(httpx.HTTPError,))
-    async def _append_batch(
-        self,
-        client: httpx.AsyncClient,
-        token: str,
-        doc_id: str,
-        blocks: list[dict],
-        batch_num: int,
-    ) -> None:
-        """
-        向文档根 block 追加一批 children。
-
-        ★ 关键：不传 index 字段。
-          飞书 API 规范：「不填时默认从最后插入」
-          这样无论 API 返回什么，顺序都由 Python for 循环决定。
-        """
-        resp = await client.post(
-            f"{self._BASE}/docx/v1/documents/{doc_id}/blocks/{doc_id}/children",
+    async def _get_revision(self, client: httpx.AsyncClient, doc_id: str) -> int:
+        token = await self._get_token(client)
+        resp = await client.get(
+            f"{self._BASE}/docx/v1/documents/{doc_id}",
             headers=self._hdr(token),
-            params={"document_revision_id": -1},  # -1 = 最新版本
-            json={"children": blocks},             # ← 无 index，追加到末尾
-            timeout=60,
+            timeout=30,
         )
-        resp.raise_for_status()
         data = resp.json()
+        if data.get("code") == 0:
+            return data["data"]["document"]["revision_id"]
+        raise RuntimeError(f"获取版本号失败: {data}")
 
-        if data.get("code") != 0:
-            raise RuntimeError(
-                f"第 {batch_num} 批插入失败: code={data['code']}, msg={data.get('msg')}"
-            )
+    # ── 插入单个 Block（版本号链式传递）──────────────────────────────────────
 
-        # 仅供诊断日志，不用于任何计数逻辑
-        api_children_count = len(data.get("data", {}).get("children", []))
-        logger.info(
-            "  第 %d 批追加成功: 发送=%d, API返回children数=%d",
-            batch_num, len(blocks), api_children_count,
-        )
-
-    # ── 分批串行追加全部 Block ────────────────────────────────────────────────
-
-    async def _append_all(
+    async def _insert_one(
         self,
         client: httpx.AsyncClient,
-        token: str,
+        doc_id: str,
+        block: dict,
+        revision_id: int,
+        seq: int,
+        total: int,
+        max_retries: int = 6,
+    ) -> int:
+        """
+        插入单个 block，返回新的 revision_id。
+
+        ★ 版本号链式传递 — 长文档乱序的终极修复
+        """
+        for attempt in range(1, max_retries + 1):
+            resp_data = None
+            try:
+                token = await self._get_token(client)
+                resp = await client.post(
+                    f"{self._BASE}/docx/v1/documents/{doc_id}/blocks/{doc_id}/children",
+                    headers=self._hdr(token),
+                    params={"document_revision_id": revision_id},
+                    json={"children": [block]},
+                    timeout=60,
+                )
+                resp_data = resp.json()
+
+            except Exception as exc:
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"block[{seq}] 网络错误（已重试 {max_retries} 次）: {exc}"
+                    )
+                try:
+                    curr_rev = await self._get_revision(client, doc_id)
+                    if curr_rev > revision_id:
+                        logger.info("block[%d] 请求超时但已插入 (rev %d→%d)",
+                                    seq, revision_id, curr_rev)
+                        return curr_rev
+                except Exception:
+                    pass
+                wait = min(2 ** attempt, 32)
+                logger.warning("block[%d] 网络错误，%ds 后重试 (%d/%d): %s",
+                               seq, wait, attempt, max_retries, exc)
+                await asyncio.sleep(wait)
+                continue
+
+            code = resp_data.get("code", -1)
+
+            if code == 0:
+                return resp_data.get("data", {}).get(
+                    "document_revision_id", revision_id + 1
+                )
+
+            if code == 99991400:
+                wait = min(2 ** attempt * 3, 60)
+                logger.warning("block[%d] 限流，等待 %ds", seq, wait)
+                await asyncio.sleep(wait)
+                continue
+
+            msg = str(resp_data.get("msg", "")).lower()
+            if "revision" in msg or code in (1770005, 1770006, 1770010):
+                try:
+                    curr_rev = await self._get_revision(client, doc_id)
+                    if curr_rev > revision_id:
+                        logger.info("block[%d] 版本冲突但已插入 (rev %d→%d)",
+                                    seq, revision_id, curr_rev)
+                        return curr_rev
+                    revision_id = curr_rev
+                except Exception:
+                    pass
+                wait = min(2 ** attempt, 16)
+                logger.warning("block[%d] 版本冲突，%ds 后重试", seq, wait)
+                await asyncio.sleep(wait)
+                continue
+
+            raise RuntimeError(
+                f"block[{seq}] 插入失败: code={code}, msg={resp_data.get('msg')}"
+            )
+
+        raise RuntimeError(f"block[{seq}] 重试 {max_retries} 次后仍失败")
+
+    # ── 版本号链式逐条插入全部 Block ──────────────────────────────────────────
+
+    async def _insert_all(
+        self,
+        client: httpx.AsyncClient,
         doc_id: str,
         blocks: list[dict],
+        initial_revision: int,
     ) -> None:
         """
-        分批、串行、追加式写入所有 block。
+        版本号链式逐条插入所有 block。
 
-        顺序保证链：
-          Python for 循环（串行）
-          → await 等待每批 HTTP 完成后再发下一批
-          → 飞书服务端按请求到达顺序追加
-          → 文档 block 顺序 == blocks 列表顺序
+        四重保证：
+          1. Python for 循环（串行）
+          2. await 等待每条完成
+          3. revision_id 链式传递
+          4. 超时验证防重复
         """
-        size = self.config.block_batch_size
         total = len(blocks)
-        total_batches = (total + size - 1) // size
-        logger.info("开始写入 %d 个 blocks，共 %d 批（每批 %d）", total, total_batches, size)
+        revision = initial_revision
 
-        for batch_idx, start in enumerate(range(0, total, size), start=1):
-            batch = blocks[start: start + size]
-            logger.info(
-                "追加第 %d/%d 批: blocks[%d:%d]",
-                batch_idx, total_batches, start, start + len(batch),
+        # 自适应延迟
+        delay = self.config.block_batch_delay
+        if total > 300:
+            delay = max(delay, 1.0)
+        elif total > 100:
+            delay = max(delay, 0.6)
+
+        logger.info("开始写入 %d 个 blocks（延迟 %.1fs，初始 rev=%d）",
+                     total, delay, revision)
+
+        t0 = time.time()
+        for i, block in enumerate(blocks):
+            if i > 0 and i % 100 == 0:
+                self._token_expire = 0.0
+                await self._get_token(client)
+
+            revision = await self._insert_one(
+                client, doc_id, block, revision, seq=i, total=total
             )
-            await self._append_batch(client, token, doc_id, batch, batch_idx)
 
-            # 批次间延迟，防止飞书限流
-            if start + size < total:
-                await asyncio.sleep(self.config.block_batch_delay)
+            if (i + 1) % 20 == 0 or i == total - 1:
+                elapsed = time.time() - t0
+                speed = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (total - i - 1) / speed if speed > 0 else 0
+                logger.info("[%d/%d] rev=%d (%.1f blocks/s, ~%.0fs)",
+                            i + 1, total, revision, speed, eta)
 
-        logger.info("全部 %d 个 blocks 写入完成", total)
+            if i < total - 1:
+                await asyncio.sleep(delay)
+
+        logger.info("全部 %d 个 blocks 写入完成（耗时 %.1fs，最终 rev=%d）",
+                     total, time.time() - t0, revision)
 
     # ── 主入口 ───────────────────────────────────────────────────────────────
 
     async def write_document(self, blocks: list[dict], title: str) -> str:
-        """创建文档并追加所有 blocks，返回文档 URL。"""
+        """创建文档并逐条写入所有 blocks，返回文档 URL。"""
         async with httpx.AsyncClient() as client:
             token = await self._get_token(client)
-            doc_id = await self._create_doc(client, token, title)
-            await self._append_all(client, token, doc_id, blocks)
+            doc_id, rev = await self._create_doc(client, token, title)
+            await self._insert_all(client, doc_id, blocks, rev)
 
         url = f"https://bytedance.feishu.cn/docx/{doc_id}"
         logger.info("文档就绪: %s", url)
